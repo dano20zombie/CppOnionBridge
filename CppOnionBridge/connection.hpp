@@ -36,6 +36,7 @@ typedef std::vector<std::string> StringVec;
 
 static asio::io_context io_context;
 static tcp::socket global_socket(io_context);
+static ssl::stream<tcp::socket&>* ssl_stream = nullptr; // Pointer to SSL stream for reuse
 
 class connection_
 {
@@ -43,132 +44,154 @@ public:
     http::status make_get(std::string host, std::string api_url, std::string request_params, std::string& response)
     {
         try {
-            if (!open_socket_SSL(host)) return http::status::bad_gateway;
+            if (!ssl_stream || last_host.empty() || last_host != host)
+            {
+                if (ssl_stream) {
+                    // Clean up the old SSL stream if switching hosts or if it's no longer valid
+                    boost::system::error_code ec;
+                    ssl_stream->shutdown(ec);
+                    delete ssl_stream;
+                    ssl_stream = nullptr;
+                    global_socket.close(); // Close the socket if switching hosts
+                }
 
-            // Prepare the HTTP request.
-            std::string target = api_url;
-            target += request_params;
+                if (!open_socket_SSL(host)) return http::status::bad_gateway;
 
+                // Re-create the SSL stream for the new connection
+                ssl::context ctx(ssl::context::sslv23);
+                ssl_stream = new ssl::stream<tcp::socket&>(global_socket, ctx);
+
+                // Perform the SSL/TLS handshake
+                ssl_stream->handshake(ssl::stream_base::client);
+
+                last_host = host;
+            }
+
+            // Prepare the HTTP request
+            std::string target = api_url + request_params;
             http::request<http::string_body> req(http::verb::get, target, 11);
             req.set(http::field::host, host);
-            req.set(http::field::user_agent, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"); //Default iOS 17.0.0 UserAgent
+            req.set(http::field::user_agent, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1");
             req.set(http::field::connection, "keep-alive");
 
-            // Create an SSL context and configure your SSL stream.
-            ssl::context ctx(ssl::context::sslv23);
-            ssl::stream<tcp::socket&> ssl_stream(global_socket, ctx);
+            // Send the HTTP request over the SSL connection
+            http::write(*ssl_stream, req);
 
-            // Assuming the socket is correctly connected, perform the SSL/TLS handshake.
-            ssl_stream.handshake(ssl::stream_base::client);
-
-            // Send the HTTP request over the SSL connection.
-            http::write(ssl_stream, req);
-
-            // Receive the HTTP response.
-            boost::beast::flat_buffer buffer;
+            // Receive the HTTP response
+            beast::flat_buffer buffer;
             http::response<http::dynamic_body> res;
-            http::read(ssl_stream, buffer, res);
+            http::read(*ssl_stream, buffer, res);
 
-            // Convert the response body into a string.
-            response = boost::beast::buffers_to_string(res.body().data());
+            // Convert the response body into a string
+            response = beast::buffers_to_string(res.body().data());
 
-            boost::system::error_code ec;
-            ssl_stream.shutdown(ec);
+            // Note: We don't shutdown and delete the SSL stream here to allow for reuse
 
-            close_socket_SSL();
-
-            return (http::status)res.result_int();
+            return static_cast<http::status>(res.result_int());
         }
         catch (boost::system::system_error const& se) {
+            // Handle specific errors and perform necessary cleanup
+            close_socket_SSL(); // Ensure the socket is closed on error
+            if (ssl_stream) {
+                delete ssl_stream;
+                ssl_stream = nullptr;
+            }
+
+            // Map specific errors to HTTP status codes
             switch (se.code().value())
             {
             case boost::asio::error::timed_out:
-                close_socket_SSL();
                 return http::status::request_timeout;
-
             case boost::asio::error::host_not_found:
             case boost::asio::error::host_unreachable:
-                close_socket_SSL();
                 return http::status::service_unavailable;
-            case WSAEADDRINUSE:
-                close_socket_SSL();
-                return http::status::bad_gateway;
-
             default:
-                close_socket_SSL();
                 return http::status::unknown;
             }
-            close_socket_SSL();
-            return http::status::unknown;
         }
     }
 
     http::status make_post(std::string host, std::string api_url, std::string request_params, std::string data, std::string& response)
     {
         try {
-            if (!open_socket_SSL(host)) return http::status::bad_gateway;
+            static ssl::stream<tcp::socket&>* ssl_stream = nullptr; // Pointer to SSL stream for reuse
+            if (!ssl_stream || last_host.empty() || last_host != host)
+            {
+                if (ssl_stream) {
+                    // Clean up the old SSL stream if switching hosts or if it's no longer valid
+                    boost::system::error_code ec;
+                    ssl_stream->shutdown(ec);
+                    delete ssl_stream;
+                    ssl_stream = nullptr;
+                    global_socket.close(); // Close the socket if switching hosts
+                }
 
-            // Prepare the HTTP request.
-            std::string target = api_url;
-            target += request_params;
+                if (!open_socket_SSL(host)) return http::status::bad_gateway;
 
+                // Re-create the SSL stream for the new connection
+                ssl::context ctx(ssl::context::sslv23);
+                ssl_stream = new ssl::stream<tcp::socket&>(global_socket, ctx);
+
+                // Perform the SSL/TLS handshake
+                ssl_stream->handshake(ssl::stream_base::client);
+
+                last_host = host;
+            }
+
+            // Prepare the HTTP request
+            std::string target = api_url + request_params;
             http::request<http::string_body> req(http::verb::post, target, 11);
             req.set(http::field::host, host);
-            req.set(http::field::user_agent, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1"); //Default iOS 17.0.0 UserAgent
+            req.set(http::field::user_agent, "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1");
             req.set(http::field::connection, "keep-alive");
+            req.body() = data;
+            req.prepare_payload(); // Ensure the Content-Length header is correctly set
 
-            // Create an SSL context and configure your SSL stream.
-            ssl::context ctx(ssl::context::sslv23);
-            ssl::stream<tcp::socket&> ssl_stream(global_socket, ctx);
+            // Send the HTTP request over the SSL connection
+            http::write(*ssl_stream, req);
 
-            // Assuming the socket is correctly connected, perform the SSL/TLS handshake.
-            ssl_stream.handshake(ssl::stream_base::client);
-
-            // Send the HTTP request over the SSL connection.
-            http::write(ssl_stream, req);
-
-            // Receive the HTTP response.
-            boost::beast::flat_buffer buffer2;
+            // Receive the HTTP response
+            beast::flat_buffer buffer;
             http::response<http::dynamic_body> res;
-            http::read(ssl_stream, buffer2, res);
+            http::read(*ssl_stream, buffer, res);
 
-            // Convert the response body into a string.
-            response = boost::beast::buffers_to_string(res.body().data());
+            // Convert the response body into a string
+            response = beast::buffers_to_string(res.body().data());
 
-            boost::system::error_code ec;
-            ssl_stream.shutdown(ec);
+            // Note: We don't shutdown and delete the SSL stream here to allow for reuse
 
-            close_socket_SSL();
-
-            return (http::status)res.result_int();
+            return static_cast<http::status>(res.result_int());
         }
         catch (boost::system::system_error const& se) {
+            // Handle specific errors and perform necessary cleanup
+            close_socket_SSL(); // Ensure the socket is closed on error
+            if (ssl_stream) {
+                delete ssl_stream;
+                ssl_stream = nullptr;
+            }
+
+            // Map specific errors to HTTP status codes
             switch (se.code().value())
             {
             case boost::asio::error::timed_out:
-                close_socket_SSL();
                 return http::status::request_timeout;
-
             case boost::asio::error::host_not_found:
             case boost::asio::error::host_unreachable:
-                close_socket_SSL();
                 return http::status::service_unavailable;
-
             default:
-                close_socket_SSL();
                 return http::status::unknown;
             }
-            close_socket_SSL();
-            return http::status::unknown;
         }
     }
 
 private:
+    std::string last_host;
+
     bool open_socket_SSL(std::string host)
     {
         try {
             // Return if the socket connection is already open.
-            if (global_socket.is_open())
+            if (global_socket.is_open() && host == last_host)
                 return true;
 
             // *** DISCLAIMER ***
@@ -207,9 +230,9 @@ private:
             memset(request, 0, sizeof(request));
 
             sprintf(request, "\x05\x01\xCC\x03%c%s\x01\xBB", static_cast<char>(host.size()), host.c_str());
+            request[2] = '\x00';
 
             // \x01\xBB : Add the port (in network byte order) (443 in case of HTTPS)
-            request[2] = '\x00';
 
             // Send the request.
             global_socket.send(boost::asio::buffer(request, 7 + host.size()));
